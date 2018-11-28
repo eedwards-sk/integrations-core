@@ -59,11 +59,11 @@ RESOURCE_TYPE_METRICS = [
     vim.VirtualMachine,
     vim.Datacenter,
     vim.HostSystem,
-    vim.Datastore
+    vim.Datastore,
+    vim.ClusterComputeResource
 ]
 
 RESOURCE_TYPE_NO_METRIC = [
-    vim.Datacenter,
     vim.ComputeResource,
     vim.Folder
 ]
@@ -287,23 +287,27 @@ class VSphereCheck(AgentCheck):
         """ Compare the available metrics for one MOR we have computed and intersect them
         with the set of metrics we want to report
         """
-        if instance.get('all_metrics', False):
-            return available_metrics
-
         i_key = self._instance_key(instance)
-        wanted_metrics = []
-        # Get only the basic metrics
-        for metric in available_metrics:
-            counter_id = metric.counterId
-            # No cache yet, skip it for now
-            if not self.metadata_cache.contains(i_key, counter_id):
-                self.log.debug("No metadata found for counter {}, will not collect it".format(counter_id))
-                continue
-            metadata = self.metadata_cache.get_metadata(i_key, counter_id)
-            if metadata.get('name') in BASIC_METRICS:
-                wanted_metrics.append(metric)
+        if self.in_compatibility_mode(instance):
+            if instance.get('all_metrics', False):
+                return available_metrics
 
-        return wanted_metrics
+            wanted_metrics = []
+            # Get only the basic metrics
+            for metric in available_metrics:
+                counter_id = metric.counterId
+                # No cache yet, skip it for now
+                if not self.metadata_cache.contains(i_key, counter_id):
+                    self.log.debug("No metadata found for counter {}, will not collect it".format(counter_id))
+                    continue
+                metadata = self.metadata_cache.get_metadata(i_key, counter_id)
+                if metadata.get('name') in BASIC_METRICS:
+                    wanted_metrics.append(metric)
+
+            return wanted_metrics
+        else:
+            # The metadata cache contains only metrics of the desired level, so use it to filter the metrics to keep
+            return [metric for metric in available_metrics if self.metadata_cache.contains(i_key, metric.counterId)]
 
     def get_external_host_tags(self):
         """
@@ -477,7 +481,7 @@ class VSphereCheck(AgentCheck):
                     instance_tags += self._get_parent_tags(obj, all_objects)
 
                 if isinstance(obj, vim.VirtualMachine):
-                    vsphere_type = u'vsphere_type:vm'
+                    vsphere_type = 'vsphere_type:vm'
                     vimtype = vim.VirtualMachine
                     mor_type = "vm"
                     power_state = properties.get("runtime.powerState")
@@ -501,9 +505,16 @@ class VSphereCheck(AgentCheck):
                     mor_type = "datastore"
                 elif isinstance(obj, vim.Datacenter):
                     vsphere_type = 'vsphere_type:datacenter'
+                    instance_tags.append("vsphere_datacenter:{}".format(properties.get("name", "unknown")))
                     hostname = None
                     vimtype = vim.Datacenter
                     mor_type = "datacenter"
+                elif isinstance(obj, vim.ClusterComputeResource):
+                    vsphere_type = 'vsphere_type:cluster'
+                    instance_tags.append("vsphere_cluster:{}".format(properties.get("name", "unknown")))
+                    hostname = None
+                    vimtype = vim.ClusterComputeResource
+                    mor_type = "cluster"
                 else:
                     vsphere_type = None
 
@@ -663,7 +674,8 @@ class VSphereCheck(AgentCheck):
 
                     # Only do this for non real-time resources i.e. datacenter and datastores
                     # For hosts and VMs, we can rely on a precomputed list of metrics
-                    if mor["mor_type"] not in REALTIME_RESOURCES and not instance.get("collect_realtime_only", False):
+                    realtime_only = is_affirmative(instance.get("collect_realtime_only", True))
+                    if mor["mor_type"] not in REALTIME_RESOURCES and not realtime_only:
                         query_spec = vim.PerformanceManager.QuerySpec()
                         query_spec.entity = mor["mor"]
                         query_spec.intervalId = mor["interval"]
@@ -871,6 +883,11 @@ class VSphereCheck(AgentCheck):
         self.gauge('vsphere.vm.count', vm_count, tags=tags)
 
     def check(self, instance):
+        from mock import MagicMock
+        self.pool = MagicMock(apply_async=lambda func, args: func(*args))
+        self.pool._workq.qsize.return_value = 0
+        self.pool_started = True  # otherwise the mock will be overwritten
+
         if not self.pool_started:
             self.start_pool()
 
